@@ -1,0 +1,6 @@
+.local/
+*.sqlite*
+.env*
+!.env.example
+node_modules/
+*.log
