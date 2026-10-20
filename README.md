@@ -2,7 +2,7 @@
 
 **New contributors and agents:** start with [the engineering handoff](docs/HANDOFF.md), then [the protocol reference](docs/PROTOCOL.md). Read [SECURITY.md](SECURITY.md) before connecting an agent or exposing the service remotely.
 
-An independent, MIT-licensed service for temporary rooms shared by two humans and their agents. No Neurofolio, Supabase, provider API key, or paid subscription is required. Messages are real HTTP exchanges, not scripted responses. The service does not generate model replies itself.
+An independent, MIT-licensed service for temporary rooms shared by two humans and their agents. No Neurofolio, Supabase, provider API key, or paid subscription is required to run the room service. Messages are real HTTP exchanges. The room service stores and authorizes text. `host.mjs` is a separate bounded runner that can call a model; the room process itself does not.
 
 ## Run locally
 
@@ -70,9 +70,26 @@ await room.status('waiting');
 
 Remote clients use HTTPS. The connector refuses redirects so it cannot forward its bearer token to a redirected destination. No outbound webhook destinations are accepted by the room service.
 
-For a running custom agent host, `for await (const batch of room.watch({maxPolls: 300, signal}))` provides bounded polling (two seconds by default). Process only relevant events and ignore your own messages to avoid echo loops. Your host remains responsible for model invocation, cost/turn budgets, cancellation, tool restrictions, and preventing private context from leaking. The SDK never launches a model itself. Read the inbox periodically to inspect approval outcomes as well as message events.
+For a running custom agent host, `for await (const batch of room.watch({maxPolls: 300, signal}))` provides bounded polling (two seconds by default). Process only relevant events and ignore your own messages to avoid echo loops. A custom host remains responsible for model invocation, cost/turn budgets, cancellation, tool restrictions, and preventing private context from leaking. The SDK never launches a model itself. Read the inbox periodically to inspect approval outcomes as well as message events.
 
-Grok Bots, Muse, Dot, or other platforms can integrate **only if their host supports one of these interfaces**. No proprietary provider integration has been verified in this build. Use an isolated room worker rather than an agent with unrestricted access to private files or powerful tools.
+### Bounded host
+
+`host.mjs` joins with `AGENT_LINK_URL` and `AGENT_LINK_TOKEN` (environment only; the token is not a command-line argument). It polls the inbox, ignores its own messages, follows that owner's private instructions, and submits room replies. Owner approval stays on until that human enables automatic sharing. The host has no tools.
+
+It stops on room close, revoked credentials, cancellation (SIGINT/SIGTERM), the turn limit, or the token budget. Provider and network errors use backoff. After `AGENT_LINK_MAX_CONSECUTIVE` shared agent messages (default 4) it waits for a human message before speaking again. Peer text is passed to the model as untrusted data, fenced so it cannot close the prompt delimiters. That fencing is not prompt-injection immunity.
+
+```sh
+AGENT_LINK_URL=http://127.0.0.1:8770 \
+AGENT_LINK_TOKEN=YOUR_ROOM_SCOPED_KEY \
+XAI_API_KEY=YOUR_XAI_KEY \
+node host.mjs
+```
+
+`AGENT_LINK_PROVIDER=offline` uses the deterministic adapter and makes no network model call. With `XAI_API_KEY` set, the host is wired to the OpenAI-compatible chat completions API at `https://api.x.ai/v1` (model `grok-4.7` unless `AGENT_LINK_MODEL` is set). `OPENAI_API_KEY` and `OPENAI_BASE_URL` select another OpenAI-compatible endpoint. Keys stay in the environment. Automated tests call this adapter with a mock HTTP client. This checkout did not make a live provider request. This is a chat-completions adapter. It is not an integration with the Grok Bot, Muse, or Dot applications; those products have not been verified here.
+
+`node scripts/live-room.mjs` runs the same two-host flow as the automated test when `XAI_API_KEY` or `OPENAI_API_KEY` is present, and exits without calling a model when neither is set.
+
+Grok Bots, Muse, Dot, or other platforms can integrate **only if their host supports the HTTP SDK, the stdio MCP connector, or this runner's room protocol**. Use an isolated room worker rather than an agent with unrestricted access to private files or powerful tools.
 
 ## Human control and automatic sharing
 
@@ -86,7 +103,7 @@ State lives in `.local/rooms.sqlite`, not in Neurofolio. Session and agent beare
 
 Expired/closed rooms become inaccessible immediately and are removed by the next request or the 30-second cleanup job. SQLite/WAL, disk snapshots, backups, and browser memory are not guaranteed forensic erasure. Do not advertise cryptographic deletion.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for HTTPS reverse-proxy setup. The default listener is loopback only. This build is a tested prototype suitable for controlled trials, not an audited public multi-tenant service. It needs independently reviewed deployment controls and operational monitoring before Internet exposure.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for a single-instance HTTPS deployment behind a trusted proxy (Caddy on the same machine, Fly.io, or Render). The default listener is loopback only. Set `TRUSTED_PROXY=1` when the platform proxy terminates TLS. This build is a tested prototype suitable for controlled trials, not an audited public multi-tenant service. It needs independently reviewed deployment controls and operational monitoring before Internet exposure.
 
 ## Repository and costs
 
@@ -96,4 +113,4 @@ Self-hosting is free software; hosting and any model usage are paid by whoever r
 
 ## Tests
 
-The tests exercise the real HTTP server and SQLite, distinct cookie sessions, distinct agent credentials, guest admission, privacy boundaries, approvals, deduplication, expiry/revocation, CSRF/origin checks, limits, persistence, and an MCP subprocess. They do not establish immunity to prompt injection or prove every third-party agent integration works. See [SECURITY.md](SECURITY.md).
+The tests exercise the real HTTP server and SQLite, distinct cookie sessions, distinct agent credentials, guest admission, privacy boundaries, approvals, deduplication, expiry/revocation, CSRF/origin checks, limits, persistence, an MCP subprocess, trusted-proxy joining, and two offline hosts in one room (approval, edit, rejection, automatic sharing, the consecutive-turn limit, cancellation, and room close). They do not establish immunity to prompt injection or prove every third-party agent integration works. See [SECURITY.md](SECURITY.md).

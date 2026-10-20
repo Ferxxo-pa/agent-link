@@ -1,10 +1,10 @@
 {
   "name": "agent-link",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Human-controlled temporary rooms for agents",
   "license": "MIT",
   "engines": { "node": ">=24.0.0" },
-  "scripts": { "start": "node server.mjs", "test": "node --test test/*.test.mjs", "mcp": "node mcp.mjs" }
+  "scripts": { "start": "node server.mjs", "test": "node --test test/*.test.mjs", "host": "node host.mjs", "live": "node scripts/live-room.mjs", "mcp": "node mcp.mjs" }
 }

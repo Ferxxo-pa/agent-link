@@ -49,14 +49,27 @@ agent replies, shared human messages, agent proposals, owner editing/approval/
 rejection, optional automatic agent sharing, revocation, expiry, polling, and
 SQLite persistence. HTTP SDK and local stdio MCP connectors are included.
 
+Also implemented in this tree: `host.mjs`, a bounded runner that uses a room key,
+calls one model adapter, and submits proposals. `provider.mjs` has a deterministic
+offline adapter and an OpenAI-compatible chat-completions adapter aimed at
+`https://api.x.ai/v1` when `XAI_API_KEY` is set (default model id `grok-4.7`,
+overridable). The automated two-host test uses the offline adapter. It covers
+approval, edit, rejection, automatic sharing, the consecutive-turn cap,
+cancellation, and room close. `scripts/live-room.mjs` runs that flow when a
+provider key is present. Trusted-proxy mode (`TRUSTED_PROXY=1`) accepts a
+forwarded HTTPS origin for a single instance. The UI labels connected, thinking,
+waiting for approval, error, and budget hit from server state.
+
 Not implemented or not verified:
 
-- Model invocation or an autonomous agent runner.
-- A real two-model conversation through this standalone broker.
+- A live call to xAI or any other provider from this checkout. The adapter was
+  tested with a mock HTTP client. `grok-4.7` is the model id documented by xAI
+  for chat completions as of October 10, 2026, not a result from a call made here.
 - Verified Grok Bot, Muse, or Dot host integrations.
 - Verified accounts, SSO, account recovery, or cross-device account identity.
 - Remote MCP HTTP transport and OAuth discovery.
-- Public HTTPS deployment, distributed rate limits, or multi-instance operation.
+- An actual Fly.io or Render deployment. DEPLOYMENT.md describes one; it was not run.
+- Distributed rate limits or multi-instance operation.
 - End-to-end encryption, payments, attachments, code execution, or billing.
 - Independent security review or proof of prompt-injection immunity.
 
@@ -76,23 +89,29 @@ Human A browser                     Human B browser
 Agent A connector                   Agent B connector
   own room-scoped bearer key          own room-scoped bearer key
           |                           |
- external agent host                external agent host
- (not included)                     (not included)
+ host.mjs (optional)               host.mjs (optional)
+  model adapter, no tools            model adapter, no tools
 ```
 
 The service is a message broker and permission boundary. It does not execute model
-output. Connectors retain their credentials outside model prompts. The external
-host controls model invocation and unrelated tools; the broker cannot secure tools
-that another application exposes to an agent.
+output. `host.mjs` is a separate process: it may call a model and then submit text
+through the same agent API as any other connector. Connectors retain their
+credentials outside model prompts. The broker cannot secure tools that another
+application exposes to an agent. This host exposes none.
 
 | File | Responsibility |
 | --- | --- |
-| `server.mjs` | HTTP routing, authentication, authorization, SQLite, limits, cleanup |
+| `server.mjs` | HTTP routing, authentication, authorization, SQLite, limits, cleanup, trusted proxy |
 | `client.mjs` | HTTP SDK, redirect refusal, timeouts, bounded polling |
+| `host.mjs` | Bounded runner: inbox, private instructions, model call, proposals, limits |
+| `provider.mjs` | Offline adapter and OpenAI-compatible chat-completions adapter |
+| `scenario.mjs` | Shared two-host flow used by the test and `scripts/live-room.mjs` |
 | `mcp.mjs` | JSON-RPC stdio lifecycle and four room tools |
 | `public/ui.js` | Human interaction, polling, admission, review, connection setup |
 | `public/style.css` | Minimal room UI and character/activity animation |
 | `test/rooms.test.mjs` | HTTP boundary, persistence, and SDK tests |
+| `test/host.test.mjs` | Two-host flow, budget, backoff, cancellation, prompt fencing |
+| `test/proxy.test.mjs` | Trusted HTTPS proxy and forwarded client limits |
 | `test/mcp.test.mjs` | MCP subprocess integration |
 
 ## Data and lifecycle
@@ -157,10 +176,12 @@ See SECURITY.md for the full boundary and DEPLOYMENT.md for hosting requirements
 
 ## Testing evidence
 
-The initial full run passed 14 automated tests. A manual browser/API check also
-created two distinct human sessions, admitted the peer, submitted an agent message,
-approved it, and observed it in the shared transcript. It explicitly used a test
-connector with no model attached. This verifies transport, not real AI integration.
+The initial full run passed 14 automated tests. Later runs add the two-host
+offline scenario, budget, backoff, cancellation, prompt fencing, and trusted-proxy
+checks. A manual browser/API check also created two distinct human sessions,
+admitted the peer, submitted an agent message, approved it, and observed it in
+the shared transcript. The offline hosts call the deterministic adapter, not a
+live provider. A live provider run still has to be recorded where a key exists.
 
 Rerun the suite for the current checkout:
 
@@ -178,18 +199,19 @@ session. Use fresh rooms and keys; historical test credentials expire.
 
 ## Next implementation milestones
 
-1. Implement a bounded external agent runner or integrate a real host. Track
-   cursors, avoid self-message echoes, process review outcomes, retry safely, and
-   stop on expiration, revocation, cancellation, or budget exhaustion.
-2. Keep provider keys in trusted host configuration. Separate private instructions
-   from shared context. Do not pass every room event into a privileged system prompt.
-3. Test two real instances end to end: private direction, proposed response,
-   edit/approval, automatic opt-in, reconnect, rejection, and shutdown.
-4. Verify each advertised provider interface. A generic MCP connector is not
-   evidence that a closed agent product supports it.
+1. A bounded runner now ships as `host.mjs`. It tracks a cursor, skips its own
+   messages, handles approval and rejection, backs off on reconnect, and stops on
+   close, cancellation, turn limit, or token budget. The offline two-host test
+   covers that flow. A live provider call from this checkout is still unverified.
+2. Provider keys stay in the host environment. Owner instructions and peer
+   messages are separate fenced blocks. The fence is not injection immunity.
+3. Verify a live two-model run with `node scripts/live-room.mjs` wherever a key
+   is available. Record the provider, model id, and that the run actually happened.
+4. Verify each advertised provider interface. A chat-completions adapter is not
+   evidence that Grok Bot, Muse, or Dot can join a room.
 5. Add verified identity and recovery before claiming verified human ownership.
-6. Deploy a controlled single-instance HTTPS trial with restricted storage,
-   operational monitoring, edge limits, and reviewed retention.
+6. Deploy the single-instance HTTPS trial described in DEPLOYMENT.md and verify
+   TLS, cookies, health checks, and the persistent disk. Documentation is not a deployment.
 7. Obtain an independent security review before broad public multi-tenant use.
 
 ## Safe repository handoff

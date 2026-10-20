@@ -2,6 +2,7 @@ import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const secret = () => randomBytes(32).toString('base64url');
@@ -16,8 +17,20 @@ function text(value, max = 4000) {
   return value.trim();
 }
 const cleanMember = m => ({ id: m.id, name: m.name, agentName: m.agent_name, status: m.status, automatic: !!m.automatic, agentStatus: m.agent_status, lastSeen: m.last_seen });
+const IPV4 = /^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const headerValue = value => typeof value === 'string' ? value.split(',')[0].trim() : '';
+function isIp(value) {
+  return typeof value === 'string' && value.length <= 64 && (IPV4.test(value) || (value.includes(':') && /^[0-9a-f:.]{2,64}$/i.test(value)));
+}
+/** Rightmost forwarded hop, or Fly-Client-IP, and only when the operator opted into a trusted proxy. */
+export function clientAddress(socketAddress, headers = {}, trustedProxy = false) {
+  if (!trustedProxy) return socketAddress || '';
+  if (isIp(headers['fly-client-ip'])) return headers['fly-client-ip'];
+  const chain = typeof headers['x-forwarded-for'] === 'string' ? headers['x-forwarded-for'].split(',').map(item => item.trim()).filter(isIp) : [];
+  return chain.at(-1) || socketAddress || '';
+}
 
-export function createApp({ database = ':memory:', publicOrigin, now = Date.now, roomTtl = 3600000, rateLimit = 120 } = {}) {
+export function createApp({ database = ':memory:', publicOrigin, now = Date.now, roomTtl = 3600000, rateLimit = 120, trustedProxy = false } = {}) {
   const db = new DatabaseSync(database);
   db.exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;
     CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, csrf TEXT NOT NULL, name TEXT NOT NULL, expires INTEGER NOT NULL);
@@ -58,16 +71,20 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
     try {
       const origin = publicOrigin || `http://127.0.0.1:${server.address()?.port}`;
       const expected = new URL(origin);
-      if (req.headers.host !== expected.host) throw error(403,'Host rejected');
-      if (req.headers.origin && req.headers.origin !== origin) throw error(403,'Origin rejected');
       const url = new URL(req.url, origin), path = url.pathname;
+      const remote = clientAddress(req.socket.remoteAddress, req.headers, trustedProxy);
+      const forwardedHost = headerValue(req.headers['x-forwarded-host']);
+      const hostOk = req.headers.host === expected.host || (trustedProxy && forwardedHost === expected.host) || (trustedProxy && path === '/health');
+      if (!hostOk) throw error(403,'Host rejected');
+      if (trustedProxy && expected.protocol === 'https:' && path !== '/health' && headerValue(req.headers['x-forwarded-proto'] || req.headers['fly-forwarded-proto']).toLowerCase() !== 'https') throw error(403,'HTTPS required');
+      if (req.headers.origin && req.headers.origin !== origin) throw error(403,'Origin rejected');
       if (expected.protocol === 'https:') res.setHeader('Strict-Transport-Security','max-age=31536000');
       const staticFiles = new Map([['/','index.html'],['/ui.js','ui.js'],['/style.css','style.css']]);
       if (req.method === 'GET' && staticFiles.has(path)) {
         res.setHeader('Content-Type', path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html; charset=utf-8');
         return res.end(await readFile(new URL('./public/'+staticFiles.get(path),import.meta.url)));
       }
-      if (path === '/health' && req.method === 'GET') return reply(200,{ok:true,service:'agent-link',version:'0.1.0'});
+      if (path === '/health' && req.method === 'GET') return reply(200,{ok:true,service:'agent-link',version:'0.2.0'});
       if (!['GET','POST'].includes(req.method)) throw error(405,'Method not allowed');
       const isAgent = path.startsWith('/api/agent/');
       let body = {};
@@ -83,7 +100,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
       if (path === '/api/session' && req.method === 'POST') {
         fields(body,['name']);
         if (!session) {
-          limit('new-session:'+req.socket.remoteAddress,20);
+          limit('new-session:'+remote,20);
           if(one('SELECT count(*) n FROM sessions').n>=1000)throw error(429,'Server at capacity');
           const name=text(body.name,60), token=secret(), id=randomUUID();
           run('INSERT INTO sessions VALUES(?,?,?,?,?)',id,hash(token),secret(),name,now()+4*3600000);
@@ -96,15 +113,15 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
         if(req.headers.cookie)throw error(403,'Use agent credentials separately from human sessions');
         const raw=/^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization||'')?.[1];
         const t=raw&&one('SELECT * FROM tokens WHERE hash=? AND expires>?',hash(raw),now());
-        if(!t) {limit('bad-agent:'+req.socket.remoteAddress,30);throw error(401,'Agent credential expired or revoked');}
+        if(!t) {limit('bad-agent:'+remote,30);throw error(401,'Agent credential expired or revoked');}
         const m=one('SELECT * FROM members WHERE id=?',t.member);const r=room(m.room);admitted(m);limit('agent:'+m.id);
         run("UPDATE members SET last_seen=?,agent_status=CASE WHEN agent_status='offline' THEN 'idle' ELSE agent_status END WHERE id=?",now(),m.id);
         if(path==='/api/agent/inbox'&&req.method==='GET'){
           const cursor=Number(url.searchParams.get('after')||0);if(!Number.isSafeInteger(cursor)||cursor<0)throw error(400,'Invalid cursor');
           const events=all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND id>? AND (private_to IS NULL OR private_to=?) ORDER BY id LIMIT 100',r.id,cursor,m.id);
-          return reply(200,{room:{id:r.id,title:r.title,expires:r.expires},self:cleanMember(m),participants:all("SELECT * FROM members WHERE room=? AND status='accepted'",r.id).map(cleanMember),events:events.map(e=>({...e,visibility:e.private_to?'private':'room',trust:'untrusted-content'})),cursor:events.at(-1)?.id||cursor,proposals:all('SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? ORDER BY rowid DESC LIMIT 50',r.id,m.id)});
+          return reply(200,{room:{id:r.id,title:r.title,expires:r.expires},self:cleanMember(m),participants:all("SELECT * FROM members WHERE room=? AND status='accepted' ORDER BY rowid",r.id).map(cleanMember),events:events.map(e=>({...e,visibility:e.private_to?'private':'room',trust:'untrusted-content'})),cursor:events.at(-1)?.id||cursor,proposals:all('SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? ORDER BY rowid DESC LIMIT 50',r.id,m.id)});
         }
-        if(path==='/api/agent/status'&&req.method==='POST'){fields(body,['status']);if(!['idle','working','waiting'].includes(body.status))throw error(400,'Invalid status');run('UPDATE members SET agent_status=? WHERE id=?',body.status,m.id);return reply(200,{status:body.status});}
+        if(path==='/api/agent/status'&&req.method==='POST'){fields(body,['status']);if(!['idle','working','waiting','error','budget'].includes(body.status))throw error(400,'Invalid status');run('UPDATE members SET agent_status=? WHERE id=?',body.status,m.id);return reply(200,{status:body.status});}
         if(path==='/api/agent/message'&&req.method==='POST'){
           fields(body,['text','visibility','requestId']);const value=text(body.text);if(!['private','room'].includes(body.visibility))throw error(400,'Choose visibility');
           if(typeof body.requestId!=='string'||!/^[A-Za-z0-9_-]{16,100}$/.test(body.requestId))throw error(400,'Stable requestId required');
@@ -136,7 +153,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
         return reply(201,{id,code});
       }
       if(path==='/api/join'&&req.method==='POST'){
-        fields(body,['code','agentName']);limit('join:'+session.id,10);limit('join-ip:'+req.socket.remoteAddress,40);
+        fields(body,['code','agentName']);limit('join:'+session.id,10);limit('join-ip:'+remote,40);
         const code=text(body.code,30),agentName=text(body.agentName,60);const r=one('SELECT * FROM rooms WHERE code_hash=? AND closed=0 AND expires>?',hash(code),now());if(!r)throw error(404,'Code invalid or room expired');
         const existing=one('SELECT * FROM members WHERE room=? AND session=?',r.id,session.id);if(existing)return reply(200,{id:r.id,status:existing.status});
         if(one('SELECT count(*) n FROM members WHERE room=?',r.id).n>=12)throw error(429,'Room join request limit reached');
@@ -147,7 +164,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
       const r=room(match[1]),m=member(r,session.id),operation=match[2];
       if(!operation&&req.method==='GET'){
         const isHost=r.host===session.id;
-        const participants=all('SELECT * FROM members WHERE room=?',r.id).filter(x=>isHost||x.status==='accepted'||x.id===m.id).map(cleanMember);
+        const participants=all('SELECT * FROM members WHERE room=? ORDER BY rowid',r.id).filter(x=>isHost||x.status==='accepted'||x.id===m.id).map(cleanMember);
         if(m.status!=='accepted')return reply(200,{id:r.id,title:r.title,expires:r.expires,self:cleanMember(m),host:false,participants,events:[],proposals:[]});
         return reply(200,{id:r.id,title:r.title,expires:r.expires,self:cleanMember(m),host:isHost,participants,events:all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND (private_to IS NULL OR private_to=?) ORDER BY id',r.id,m.id),proposals:all("SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? AND status='pending'",r.id,m.id)});
       }
@@ -188,8 +205,11 @@ if(process.argv[1]===fileURLToPath(import.meta.url)){
   const port=Number(process.env.PORT||8770),host=process.env.HOST||'127.0.0.1';
   const publicOrigin=process.env.PUBLIC_ORIGIN||`http://127.0.0.1:${port}`;
   const origin=new URL(publicOrigin);
+  const trustedProxy=process.env.TRUSTED_PROXY==='1';
   if(origin.origin!==publicOrigin||origin.username||origin.password)throw new Error('PUBLIC_ORIGIN must be an exact origin');
   if(origin.protocol!=='https:'&&!(host==='127.0.0.1'&&origin.hostname==='127.0.0.1'))throw new Error('Remote use requires HTTPS via a trusted reverse proxy');
-  const dir=new URL('./.local/',import.meta.url);await mkdir(dir,{recursive:true});
-  createApp({database:fileURLToPath(new URL('rooms.sqlite',dir)),publicOrigin}).listen(port,host,()=>console.log(`Agent Link: ${publicOrigin} (guest sessions; room access requires host approval)`));
+  if(trustedProxy&&origin.protocol!=='https:')throw new Error('TRUSTED_PROXY requires PUBLIC_ORIGIN to use HTTPS');
+  const dir=process.env.AGENT_LINK_DATA||fileURLToPath(new URL('./.local/',import.meta.url));
+  await mkdir(dir,{recursive:true,mode:0o700});
+  createApp({database:join(dir,'rooms.sqlite'),publicOrigin,trustedProxy}).listen(port,host,()=>console.log(`Agent Link: ${publicOrigin} (guest sessions; room access requires host approval)`));
 }

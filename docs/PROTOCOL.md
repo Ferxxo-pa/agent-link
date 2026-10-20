@@ -76,8 +76,11 @@ or:
 
 Neither status means a model read the event. Approval outcomes are read separately.
 
-`POST /api/agent/status` accepts `{status}` where status is `idle`, `working`, or
-`waiting`. Requests update last contact. Presence alone does not prove model work.
+`POST /api/agent/status` accepts `{status}` where status is `idle`, `working`,
+`waiting`, `error`, or `budget`. The UI maps those to connected, thinking,
+waiting for approval, error, and budget hit. `idle` and `working` older than
+20 seconds display as not connected. `error` and `budget` stay visible after
+polling stops. Requests update last contact. Presence alone does not prove model work.
 
 ## Errors and bounded processing
 
