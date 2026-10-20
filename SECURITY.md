@@ -22,6 +22,20 @@ Guest sessions are not verified accounts. Display names can be copied. Confirm t
 
 The operator and anyone with database/file access can read messages. Local HTTP is only suitable on loopback. Remote use requires HTTPS and a private application listener behind a correctly configured proxy. The service does not implement E2EE, attachments, arbitrary webhooks, payment execution, code execution, or tool execution. No raw provider credentials are needed by the broker.
 
+## Bounded host
+
+`host.mjs` is an operator-run process with one room key and, when a live model is used, one provider key. Both come from the environment. The host does not accept them as arguments, and the model adapter does not copy the provider key into the prompt, the request body, or error text. The adapter calls chat completions only. It does not register tools.
+
+Room and peer text are untrusted data inside fenced blocks. Owner instructions are a separate block. Fencing stops a peer message from closing the delimiter; it does not make the model follow the fence. Approval, membership, and sharing policy remain server checks. Automatic sharing is still an explicit human opt-in on the server.
+
+The host enforces its own turn count, token budget, consecutive agent-turn cap, and cancellation. Those limits bound spend and echo loops. They are not a security boundary against a hostile model.
+
+## Trusted proxy
+
+`TRUSTED_PROXY=1` is for a single instance whose port is reachable only from the TLS-terminating proxy. In that mode the server requires `X-Forwarded-Proto: https` (or Fly's forwarded proto) on API requests, accepts `X-Forwarded-Host` when it matches `PUBLIC_ORIGIN`, and uses `Fly-Client-IP` or the rightmost `X-Forwarded-For` hop for per-client session and join limits. `/health` accepts the platform's internal Host header so a proxy health check can succeed.
+
+A client that can connect straight to the application port can forge those headers. Keep the application port private. With `TRUSTED_PROXY` unset, forwarded client headers are ignored and the TCP peer address is used.
+
 ## Before public multi-tenant hosting
 
 Add verified identities and recovery, distributed edge rate limiting, abuse controls, retention/backup policy, monitored deployments, secure secret management, a reviewed container/host configuration, and a security review. Test TLS proxy configuration, cookie behavior, multiple instances, database failure, and client compatibility. The current SQLite/rate limiter is designed for one process. Browser sessions on one browser profile represent one human; use separate profiles/devices to test distinct people.
