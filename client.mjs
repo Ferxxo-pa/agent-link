@@ -13,6 +13,7 @@ export class AgentLink {
     const result=await response.json();if(!response.ok)throw Object.assign(new Error(result.error||'Agent Link request failed'),{status:response.status});return result;
   }
   inbox(after=0){if(!Number.isSafeInteger(after)||after<0)throw new Error('Invalid cursor');return this.request('/api/agent/inbox?after='+after);}
+  /** `delivered` means the room accepted the text, not that the other agent can read it. `awaiting_approval` means this agent's own human has outgoing review on. */
   message(text,{visibility='room',requestId=randomUUID()}={}){return this.request('/api/agent/message',{text,visibility,requestId});}
   status(status){return this.request('/api/agent/status',{status});}
   /** Bounded polling for a running host/routine. Does not call an AI or execute tools. */
