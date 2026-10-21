@@ -15,22 +15,39 @@ function text(value, max = 4000) {
   if (typeof value !== 'string' || !value.trim() || value.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(value)) throw error(400, 'Invalid text');
   return value.trim();
 }
-const cleanMember = m => ({ id: m.id, name: m.name, agentName: m.agent_name, status: m.status, automatic: !!m.automatic, agentStatus: m.agent_status, lastSeen: m.last_seen });
+// Review flags stay on the caller's own member. Participants must not carry them.
+function publicMember(m) {
+  return { id: m.id, name: m.name, agentName: m.agent_name, status: m.status, agentStatus: m.agent_status, lastSeen: m.last_seen };
+}
+function selfMember(m) {
+  return { ...publicMember(m), incomingReview: !!m.incoming_review, outgoingReview: !!m.outgoing_review };
+}
 
 export function createApp({ database = ':memory:', publicOrigin, now = Date.now, roomTtl = 3600000, rateLimit = 120 } = {}) {
   const db = new DatabaseSync(database);
   db.exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;
     CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, csrf TEXT NOT NULL, name TEXT NOT NULL, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS rooms(id TEXT PRIMARY KEY, host TEXT NOT NULL, code_hash TEXT UNIQUE NOT NULL, title TEXT NOT NULL, expires INTEGER NOT NULL, closed INTEGER NOT NULL DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS members(id TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, session TEXT NOT NULL, name TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, automatic INTEGER NOT NULL DEFAULT 0, agent_status TEXT NOT NULL DEFAULT 'offline', last_seen INTEGER NOT NULL DEFAULT 0, UNIQUE(room,session));
+    CREATE TABLE IF NOT EXISTS members(id TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, session TEXT NOT NULL, name TEXT NOT NULL, agent_name TEXT NOT NULL, status TEXT NOT NULL, agent_status TEXT NOT NULL DEFAULT 'offline', last_seen INTEGER NOT NULL DEFAULT 0, incoming_review INTEGER NOT NULL DEFAULT 1, outgoing_review INTEGER NOT NULL DEFAULT 0, UNIQUE(room,session));
     CREATE TABLE IF NOT EXISTS tokens(hash TEXT PRIMARY KEY, member TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, member TEXT NOT NULL, actor TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, private_to TEXT, at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, member TEXT NOT NULL, text TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS holds(id TEXT PRIMARY KEY, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, recipient TEXT NOT NULL, event_id INTEGER NOT NULL, source_member TEXT NOT NULL, actor TEXT NOT NULL, text TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS releases(id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, recipient TEXT NOT NULL, event_id INTEGER NOT NULL, member TEXT NOT NULL, actor TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, private_to TEXT, at INTEGER NOT NULL, edited INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS requests(member TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL, result TEXT NOT NULL, room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, PRIMARY KEY(member,request_id));
+    CREATE UNIQUE INDEX IF NOT EXISTS holds_recipient_event ON holds(recipient, event_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS releases_recipient_event ON releases(recipient, event_id);
   `);
   const one = (sql, ...args) => db.prepare(sql).get(...args);
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => db.prepare(sql).run(...args);
+  // Older databases kept an `automatic` column (1 = share outgoing text without review).
+  const memberCols = new Set(all('PRAGMA table_info(members)').map(c => c.name));
+  if (!memberCols.has('incoming_review')) run('ALTER TABLE members ADD COLUMN incoming_review INTEGER NOT NULL DEFAULT 1');
+  if (!memberCols.has('outgoing_review')) {
+    run('ALTER TABLE members ADD COLUMN outgoing_review INTEGER NOT NULL DEFAULT 0');
+    if (memberCols.has('automatic')) run('UPDATE members SET outgoing_review=CASE WHEN automatic=1 THEN 0 ELSE 1 END');
+  }
   const buckets = new Map();
   function limit(key, ceiling = rateLimit) {
     const t = now();
@@ -41,15 +58,63 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
   function room(id) { const r = one('SELECT * FROM rooms WHERE id=?', id); if (!r || r.closed || r.expires <= now()) throw error(410, 'Room ended or expired'); return r; }
   function member(r, sid) { const m = one('SELECT * FROM members WHERE room=? AND session=?', r.id, sid); if (!m) throw error(404,'Room not found'); return m; }
   function admitted(m) { if (m.status !== 'accepted') throw error(403,'The host must approve your entry'); }
+  function queued(recipientId, eventId) {
+    return one('SELECT 1 AS x FROM releases WHERE recipient=? AND event_id=?', recipientId, eventId)
+      || one('SELECT 1 AS x FROM holds WHERE recipient=? AND event_id=?', recipientId, eventId);
+  }
+  // Agent inbox rows. A room event stays in the human transcript either way.
+  // incoming_review holds the other party's room messages until this human releases a copy to their own agent.
+  function releaseTo(recipientId, e, value = e.text, edited = false) {
+    const result = run('INSERT OR IGNORE INTO releases(room,recipient,event_id,member,actor,kind,text,private_to,at,edited) VALUES(?,?,?,?,?,?,?,?,?,?)', e.room, recipientId, e.id, e.member, e.actor, e.kind, value, e.private_to, e.at, edited ? 1 : 0);
+    return Number(result.changes) === 1;
+  }
+  function holdTo(r, recipient, e) {
+    const id = randomUUID();
+    const digest = hash(JSON.stringify([r.id, recipient.id, id, e.id, e.text]));
+    run('INSERT OR IGNORE INTO holds(id,room,recipient,event_id,source_member,actor,text,digest,expires) VALUES(?,?,?,?,?,?,?,?,?)', id, r.id, recipient.id, e.id, e.member, e.actor, e.text, digest, Math.min(r.expires, now() + 300000));
+  }
+  function routeTo(r, recipient, e) {
+    if (e.private_to && e.private_to !== recipient.id) return;
+    if (queued(recipient.id, e.id)) return;
+    const inbound = !e.private_to && e.member !== recipient.id && (e.kind === 'message' || e.kind === 'approved-message');
+    if (inbound && recipient.incoming_review) holdTo(r, recipient, e);
+    else releaseTo(recipient.id, e);
+  }
+  function routeAll(r, e) {
+    for (const recipient of all("SELECT * FROM members WHERE room=? AND status='accepted'", r.id)) routeTo(r, recipient, e);
+  }
+  function syncMember(r, memberId) {
+    const fresh = one('SELECT * FROM members WHERE id=?', memberId);
+    if (!fresh || fresh.status !== 'accepted') return;
+    for (const e of all('SELECT * FROM events WHERE room=? ORDER BY id', r.id)) routeTo(r, fresh, e);
+  }
   function event(r, m, actor, kind, value, privateTo = null) {
     if (one('SELECT count(*) n FROM events WHERE room=?', r.id).n >= 1000) throw error(429,'Room message limit reached');
-    return Number(run('INSERT INTO events(room,member,actor,kind,text,private_to,at) VALUES(?,?,?,?,?,?,?)',r.id,m.id,actor,kind,value,privateTo,now()).lastInsertRowid);
+    const at = now();
+    const id = Number(run('INSERT INTO events(room,member,actor,kind,text,private_to,at) VALUES(?,?,?,?,?,?,?)', r.id, m.id, actor, kind, value, privateTo, at).lastInsertRowid);
+    routeAll(r, { id, room: r.id, member: m.id, actor, kind, text: value, private_to: privateTo, at });
+    return id;
+  }
+  function pendingHolds(r, memberId) {
+    return all("SELECT id,event_id,source_member,actor,text,digest,expires FROM holds WHERE room=? AND recipient=? AND status='pending' AND expires>?", r.id, memberId, now())
+      .map(h => ({ id: h.id, eventId: Number(h.event_id), sourceMember: h.source_member, actor: h.actor, text: h.text, digest: h.digest, expires: h.expires }));
+  }
+  function agentEvent(e) {
+    const item = { id: Number(e.id), eventId: Number(e.event_id), member: e.member, actor: e.actor, kind: e.kind, text: e.text, private_to: e.private_to, at: e.at, visibility: e.private_to ? 'private' : 'room', trust: 'untrusted-content' };
+    if (e.edited) item.edited = true;
+    return item;
+  }
+  function transact(fn) {
+    db.exec('BEGIN IMMEDIATE');
+    try { const value = fn(); db.exec('COMMIT'); return value; }
+    catch (e) { db.exec('ROLLBACK'); throw e; }
   }
   function purge() {
-    run('DELETE FROM rooms WHERE expires<=? OR closed=1',now());
-    run('DELETE FROM sessions WHERE expires<=?',now());
-    run('DELETE FROM tokens WHERE expires<=?',now());
-    run("UPDATE proposals SET status='expired' WHERE status='pending' AND expires<=?",now());
+    run('DELETE FROM rooms WHERE expires<=? OR closed=1', now());
+    run('DELETE FROM sessions WHERE expires<=?', now());
+    run('DELETE FROM tokens WHERE expires<=?', now());
+    run("UPDATE proposals SET status='expired' WHERE status='pending' AND expires<=?", now());
+    run("UPDATE holds SET status='expired' WHERE status='pending' AND expires<=?", now());
   }
   const server = http.createServer(async (req, res) => {
     const reply = (status, value, headers={}) => { res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', ...headers }); res.end(JSON.stringify(value)); };
@@ -67,7 +132,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
         res.setHeader('Content-Type', path.endsWith('.js')?'text/javascript':path.endsWith('.css')?'text/css':'text/html; charset=utf-8');
         return res.end(await readFile(new URL('./public/'+staticFiles.get(path),import.meta.url)));
       }
-      if (path === '/health' && req.method === 'GET') return reply(200,{ok:true,service:'agent-link',version:'0.1.0'});
+      if (path === '/health' && req.method === 'GET') return reply(200,{ok:true,service:'agent-link',version:'0.2.0'});
       if (!['GET','POST'].includes(req.method)) throw error(405,'Method not allowed');
       const isAgent = path.startsWith('/api/agent/');
       let body = {};
@@ -101,8 +166,10 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
         run("UPDATE members SET last_seen=?,agent_status=CASE WHEN agent_status='offline' THEN 'idle' ELSE agent_status END WHERE id=?",now(),m.id);
         if(path==='/api/agent/inbox'&&req.method==='GET'){
           const cursor=Number(url.searchParams.get('after')||0);if(!Number.isSafeInteger(cursor)||cursor<0)throw error(400,'Invalid cursor');
-          const events=all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND id>? AND (private_to IS NULL OR private_to=?) ORDER BY id LIMIT 100',r.id,cursor,m.id);
-          return reply(200,{room:{id:r.id,title:r.title,expires:r.expires},self:cleanMember(m),participants:all("SELECT * FROM members WHERE room=? AND status='accepted'",r.id).map(cleanMember),events:events.map(e=>({...e,visibility:e.private_to?'private':'room',trust:'untrusted-content'})),cursor:events.at(-1)?.id||cursor,proposals:all('SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? ORDER BY rowid DESC LIMIT 50',r.id,m.id)});
+          syncMember(r,m.id);
+          const events=all('SELECT id,event_id,member,actor,kind,text,private_to,at,edited FROM releases WHERE room=? AND recipient=? AND id>? ORDER BY id LIMIT 100',r.id,m.id,cursor);
+          const last=events.at(-1);
+          return reply(200,{room:{id:r.id,title:r.title,expires:r.expires},self:selfMember(one('SELECT * FROM members WHERE id=?',m.id)),participants:all("SELECT * FROM members WHERE room=? AND status='accepted'",r.id).map(publicMember),events:events.map(agentEvent),cursor:last?Number(last.id):cursor,proposals:all('SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? ORDER BY rowid DESC LIMIT 50',r.id,m.id)});
         }
         if(path==='/api/agent/status'&&req.method==='POST'){fields(body,['status']);if(!['idle','working','waiting'].includes(body.status))throw error(400,'Invalid status');run('UPDATE members SET agent_status=? WHERE id=?',body.status,m.id);return reply(200,{status:body.status});}
         if(path==='/api/agent/message'&&req.method==='POST'){
@@ -111,12 +178,15 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
           const digest=hash(JSON.stringify([value,body.visibility]));const prior=one('SELECT * FROM requests WHERE member=? AND request_id=?',m.id,body.requestId);
           if(prior){if(prior.digest!==digest)throw error(409,'Request ID already used for different content');return reply(200,JSON.parse(prior.result));}
           if(one('SELECT count(*) n FROM requests WHERE room=?',r.id).n>=1000)throw error(429,'Room request limit reached');
-          let result;
-          db.exec('BEGIN IMMEDIATE');try {
-            if(body.visibility==='private'||m.automatic){const id=event(r,m,'agent','message',value,body.visibility==='private'?m.id:null);result={status:'delivered',eventId:id};}
-            else{if(one("SELECT count(*) n FROM proposals WHERE room=? AND member=? AND status='pending'",r.id,m.id).n>=20)throw error(429,'Resolve pending proposals first');const id=randomUUID(),d=hash(JSON.stringify([r.id,m.id,id,value]));run('INSERT INTO proposals(id,room,member,text,digest,expires) VALUES(?,?,?,?,?,?)',id,r.id,m.id,value,d,Math.min(r.expires,now()+300000));result={status:'awaiting_approval',proposalId:id,digest:d};}
-            run('INSERT INTO requests VALUES(?,?,?,?,?)',m.id,body.requestId,digest,JSON.stringify(result),r.id);db.exec('COMMIT');
-          }catch(e){db.exec('ROLLBACK');throw e;}return reply(201,result);
+          const result=transact(()=>{
+            const current=one('SELECT * FROM members WHERE id=?',m.id);
+            let outcome;
+            if(body.visibility==='private'||!current.outgoing_review){const id=event(r,current,'agent','message',value,body.visibility==='private'?current.id:null);outcome={status:'delivered',eventId:id};}
+            else{if(one("SELECT count(*) n FROM proposals WHERE room=? AND member=? AND status='pending'",r.id,current.id).n>=20)throw error(429,'Resolve pending proposals first');const id=randomUUID(),d=hash(JSON.stringify([r.id,current.id,id,value]));run('INSERT INTO proposals(id,room,member,text,digest,expires) VALUES(?,?,?,?,?,?)',id,r.id,current.id,value,d,Math.min(r.expires,now()+300000));outcome={status:'awaiting_approval',proposalId:id,digest:d};}
+            run('INSERT INTO requests VALUES(?,?,?,?,?)',current.id,body.requestId,digest,JSON.stringify(outcome),r.id);
+            return outcome;
+          });
+          return reply(201,result);
         }
         throw error(404,'Agent operation not available');
       }
@@ -147,32 +217,77 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
       const r=room(match[1]),m=member(r,session.id),operation=match[2];
       if(!operation&&req.method==='GET'){
         const isHost=r.host===session.id;
-        const participants=all('SELECT * FROM members WHERE room=?',r.id).filter(x=>isHost||x.status==='accepted'||x.id===m.id).map(cleanMember);
-        if(m.status!=='accepted')return reply(200,{id:r.id,title:r.title,expires:r.expires,self:cleanMember(m),host:false,participants,events:[],proposals:[]});
-        return reply(200,{id:r.id,title:r.title,expires:r.expires,self:cleanMember(m),host:isHost,participants,events:all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND (private_to IS NULL OR private_to=?) ORDER BY id',r.id,m.id),proposals:all("SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? AND status='pending'",r.id,m.id)});
+        const participants=all('SELECT * FROM members WHERE room=?',r.id).filter(x=>isHost||x.status==='accepted'||x.id===m.id).map(publicMember);
+        if(m.status!=='accepted')return reply(200,{id:r.id,title:r.title,expires:r.expires,self:selfMember(m),host:false,participants,events:[],proposals:[],holds:[]});
+        syncMember(r,m.id);
+        return reply(200,{id:r.id,title:r.title,expires:r.expires,self:selfMember(one('SELECT * FROM members WHERE id=?',m.id)),host:isHost,participants,events:all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND (private_to IS NULL OR private_to=?) ORDER BY id',r.id,m.id),proposals:all("SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? AND status='pending' AND expires>?",r.id,m.id,now()),holds:pendingHolds(r,m.id)});
       }
       admitted(m);if(req.method!=='POST')throw error(405,'Method not allowed');
       if(operation==='admit'){
         fields(body,['memberId','accept']);if(r.host!==session.id)throw error(403,'Only host can admit');if(typeof body.accept!=='boolean'||typeof body.memberId!=='string')throw error(400,'Choose a request and accept or decline');
         const target=one("SELECT * FROM members WHERE id=? AND room=? AND status='waiting'",body.memberId,r.id);if(!target)throw error(409,'Request already resolved');
         if(body.accept&&one("SELECT count(*) n FROM members WHERE room=? AND status='accepted'",r.id).n>=2)throw error(409,'This version supports two human-agent pairs');
-        run('UPDATE members SET status=? WHERE id=?',body.accept?'accepted':'declined',target.id);event(r,m,'system','membership',`${target.name} ${body.accept?'joined':'was declined'}`);return reply(200,{ok:true});
+        transact(()=>{
+          run('UPDATE members SET status=? WHERE id=?',body.accept?'accepted':'declined',target.id);
+          if(body.accept)syncMember(r,target.id);
+          event(r,m,'system','membership',`${target.name} ${body.accept?'joined':'was declined'}`);
+        });
+        return reply(200,{ok:true});
       }
       if(operation==='credential'){
         fields(body,[]);const value=secret();run('DELETE FROM tokens WHERE member=?',m.id);run('INSERT INTO tokens VALUES(?,?,?)',hash(value),m.id,r.expires);return reply(201,{token:value,expires:r.expires,scope:'This agent in this room only',url:origin});
       }
       if(operation==='revoke'){fields(body,[]);run('DELETE FROM tokens WHERE member=?',m.id);run("UPDATE members SET agent_status='offline',last_seen=0 WHERE id=?",m.id);return reply(200,{revoked:true});}
       if(operation==='policy'){
-        fields(body,['automatic']);if(typeof body.automatic!=='boolean')throw error(400,'Choose a sharing policy');run('UPDATE members SET automatic=? WHERE id=?',Number(body.automatic),m.id);event(r,m,'human','policy',body.automatic?'Enabled automatic room messages for own agent':'Enabled review before sharing for own agent');return reply(200,{automatic:body.automatic});
+        fields(body,['incomingReview','outgoingReview']);
+        const hasIn=Object.hasOwn(body,'incomingReview'),hasOut=Object.hasOwn(body,'outgoingReview');
+        if(hasIn===hasOut)throw error(400,'Choose one sharing policy');
+        if((hasIn&&typeof body.incomingReview!=='boolean')||(hasOut&&typeof body.outgoingReview!=='boolean'))throw error(400,'Choose a sharing policy');
+        transact(()=>{
+          if(hasIn){
+            run('UPDATE members SET incoming_review=? WHERE id=?',Number(body.incomingReview),m.id);
+            event(r,m,'human','policy',body.incomingReview?'Incoming room messages wait for your approval before your agent can read them.':'Incoming room messages go straight to your agent.',m.id);
+          }else{
+            run('UPDATE members SET outgoing_review=? WHERE id=?',Number(body.outgoingReview),m.id);
+            event(r,m,'human','policy',body.outgoingReview?'Your agent\'s room messages wait for your approval.':'Your agent\'s room messages are shared without your approval.',m.id);
+          }
+        });
+        const updated=one('SELECT * FROM members WHERE id=?',m.id);
+        return reply(200,{incomingReview:!!updated.incoming_review,outgoingReview:!!updated.outgoing_review});
       }
       if(operation==='message'){
-        fields(body,['text','visibility']);if(!['private','room'].includes(body.visibility))throw error(400,'Choose visibility');const id=event(r,m,'human','message',text(body.text),body.visibility==='private'?m.id:null);return reply(201,{eventId:id});
+        fields(body,['text','visibility']);if(!['private','room'].includes(body.visibility))throw error(400,'Choose visibility');const value=text(body.text);
+        const id=transact(()=>event(r,m,'human','message',value,body.visibility==='private'?m.id:null));
+        return reply(201,{eventId:id});
       }
       if(operation==='decision'){
         fields(body,['id','digest','decision','text']);if(!['approve','reject'].includes(body.decision)||typeof body.id!=='string'||typeof body.digest!=='string')throw error(400,'Invalid decision');
-        const p=one('SELECT * FROM proposals WHERE id=? AND room=? AND member=?',body.id,r.id,m.id);if(!p)throw error(404,'Proposal not found');if(p.status!=='pending'||p.expires<=now()||!same(body.digest,p.digest))throw error(409,'Proposal changed, expired, or already decided');
-        const approved=body.decision==='approve';const value=approved?text(body.text??p.text):body.text?text(body.text):'Please revise your proposed message.';
-        db.exec('BEGIN IMMEDIATE');try{run('UPDATE proposals SET status=? WHERE id=?',approved?'approved':'rejected',p.id);event(r,m,approved?'agent':'human',approved?'approved-message':'feedback',value,approved?null:m.id);event(r,m,'human','decision',approved?'Approved agent message':'Requested changes',m.id);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}
+        const proposal=one('SELECT * FROM proposals WHERE id=? AND room=? AND member=?',body.id,r.id,m.id);
+        const hold=one('SELECT * FROM holds WHERE id=? AND room=? AND recipient=?',body.id,r.id,m.id);
+        if(proposal&&hold)throw error(409,'Proposal changed, expired, or already decided');
+        if(!proposal&&!hold)throw error(404,'Not found');
+        const chosen=proposal||hold;
+        if(chosen.status!=='pending'||chosen.expires<=now()||!same(body.digest,chosen.digest))throw error(409,'Proposal changed, expired, or already decided');
+        const approved=body.decision==='approve';
+        if(proposal){
+          const value=approved?text(body.text??proposal.text):body.text?text(body.text):'Please revise your proposed message.';
+          transact(()=>{
+            const changed=run("UPDATE proposals SET status=? WHERE id=? AND status='pending'",approved?'approved':'rejected',proposal.id);
+            if(!Number(changed.changes))throw error(409,'Proposal changed, expired, or already decided');
+            event(r,m,approved?'agent':'human',approved?'approved-message':'feedback',value,approved?null:m.id);
+            event(r,m,'human','decision',approved?'Approved agent message':'Requested changes',m.id);
+          });
+          return reply(200,{status:approved?'approved':'rejected'});
+        }
+        const source=one('SELECT * FROM events WHERE id=? AND room=?',hold.event_id,r.id);
+        if(!source||source.private_to)throw error(409,'Proposal changed, expired, or already decided');
+        const value=approved?text(body.text??hold.text):null;
+        transact(()=>{
+          const changed=run("UPDATE holds SET status=? WHERE id=? AND status='pending'",approved?'approved':'rejected',hold.id);
+          if(!Number(changed.changes))throw error(409,'Proposal changed, expired, or already decided');
+          if(approved){if(!releaseTo(m.id,source,value,value!==source.text))throw error(409,'Proposal changed, expired, or already decided');}
+          else event(r,m,'human','decision','Held back an incoming room message before your agent could read it.',m.id);
+        });
         return reply(200,{status:approved?'approved':'rejected'});
       }
       if(operation==='code'){fields(body,[]);if(r.host!==session.id)throw error(403,'Only host can rotate invite');const code=randomBytes(9).toString('base64url');run('UPDATE rooms SET code_hash=? WHERE id=?',hash(code),r.id);return reply(200,{code});}

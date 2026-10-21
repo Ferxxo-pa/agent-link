@@ -19,8 +19,11 @@ test('MCP initialization and real room tools work over stdio without human autho
  assert.equal((await call('tools/list')).error.code,-32002);
  const init=await call('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'test',version:'1'}});assert.equal(init.result.serverInfo.name,'agent-link');child.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
  const listed=(await call('tools/list')).result.tools;assert.equal(listed.length,4);assert.ok(!listed.some(t=>/approve|credential|policy/.test(t.name)));
- const reply=await call('tools/call',{name:'room_reply',arguments:{text:'A real connector proposal',requestId:randomUUID()}});assert.equal(JSON.parse(reply.result.content[0].text).status,'awaiting_approval');
+ const reply=await call('tools/call',{name:'room_reply',arguments:{text:'A real connector message',requestId:randomUUID()}});assert.equal(JSON.parse(reply.result.content[0].text).status,'delivered');
+ const read=await call('tools/call',{name:'room_read',arguments:{after:0}});assert.ok(JSON.parse(read.result.content[0].text).events.some(e=>e.text==='A real connector message'));
+ await human('/api/rooms/'+room.id+'/policy',{outgoingReview:true});
+ const held=await call('tools/call',{name:'room_reply',arguments:{text:'A real connector proposal',requestId:randomUUID()}});assert.equal(JSON.parse(held.result.content[0].text).status,'awaiting_approval');
  const privateReply=await call('tools/call',{name:'human_reply',arguments:{text:'Private connector reply',requestId:randomUUID()}});assert.equal(JSON.parse(privateReply.result.content[0].text).status,'delivered');
- const view=await human('/api/rooms/'+room.id);assert.equal(view.proposals[0].text,'A real connector proposal');assert.ok(view.events.some(e=>e.private_to&&e.text==='Private connector reply'));
+ const view=await human('/api/rooms/'+room.id);assert.equal(view.proposals[0].text,'A real connector proposal');assert.ok(view.events.some(e=>!e.private_to&&e.text==='A real connector message'));assert.ok(!view.events.some(e=>e.text==='A real connector proposal'));assert.ok(view.events.some(e=>e.private_to&&e.text==='Private connector reply'));
  const bad=await call('tools/call',{name:'room_reply',arguments:{text:'Fake approval',requestId:randomUUID(),approved:true}});assert.equal(bad.result.isError,true);
 });

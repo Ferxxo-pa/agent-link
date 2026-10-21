@@ -5,18 +5,24 @@
 - A room code is a request-to-join mechanism. An admitted host must approve the second human. Pending guests get metadata about accepted participants, not messages or drafts.
 - A browser session owns one member identity. There is no client-controlled sender or owner field.
 - An agent token belongs to exactly one admitted member and expires with that room. Rotation removes previous tokens. Either human can end the room. Tokens cannot approve, admit, close, create credentials, or change sharing policy.
-- Every read filters private content by member identity. Human and agent writes enforce their own role, size, visibility, and sharing policy.
-- Draft approval checks the owner, room, content digest, expiration, and pending state. The human may explicitly edit the outgoing text. Publishing and resolving the proposal occur in one database transaction.
-- Stable outgoing agent request IDs are unique per agent member. Reusing an ID with different text fails. Delivery retries return the original result; proposal outcome is available separately through inbox reads.
+- Every read filters private content by member identity. Human and agent writes enforce their own role, size, visibility, and review switches. Review switches are returned only on the caller's own member, not on other participants.
+- Incoming review defaults to on. A room message from the other human or the other agent creates a hold that only the receiving human can list, approve, edit, or reject. Approval checks that human, the room, the content digest, expiration, and pending state, then writes a copy into that agent's inbox in the same transaction. An edit does not rewrite the shared transcript. Rejection records a private notice that does not include the withheld text. The sender cannot see the hold or learn the decision from this service.
+- Outgoing review defaults to off. When a human turns it on, their agent's room reply stays a private draft. Draft approval checks the owner, room, content digest, expiration, and pending state. The human may edit the text that gets published. Publishing and resolving the draft occur in one database transaction. The other human still cannot see or approve that draft. After publication, the recipient's incoming review applies separately.
+- Private messages between a human and their own agent never create a hold. Own room messages are released to that human's own agent without waiting.
+- Stable outgoing agent request IDs are unique per agent member. Reusing an ID with different text fails. Delivery retries return the original result; an outgoing proposal's later outcome is available separately through inbox reads. `delivered` is not evidence that the other agent was allowed to read the event.
 - Same-origin browser writes require a session CSRF token. Cookies are HttpOnly and SameSite=Strict, plus Secure when configured for HTTPS. Host/origin checks and no permissive CORS restrict browser cross-origin access.
 - UI text is rendered through textContent, not interpreted HTML. A restrictive CSP blocks inline scripts, frames, and external resources.
-- Per-session/per-agent rate limits, request sizes, room count, join count, message count, pending proposal count, and expiration bound single-process storage and request load. Startup requires HTTPS configuration for non-loopback use.
+- Per-session/per-agent rate limits, request sizes, room count, join count, message count, pending outgoing-draft count, and expiration bound single-process storage and request load. Pending incoming holds are bounded by the room message cap and expire with the same five-minute limit. Startup requires HTTPS configuration for non-loopback use.
 
 ## What is not claimed
 
 Prompt injection cannot be eliminated by this service. Peer messages and tool results are untrusted. An external agent can still be manipulated into reasoning badly or misusing unrelated tools that its host gives it. Prefer a room-specific agent with no external tools or private credentials. Do not allow model output to become instructions for a privileged executor.
 
-Automatic sharing is an explicit removal of the outgoing review barrier, not a guarantee of safe content. Any participant can manually disclose information they know. Approved text is attributed, not certified as truthful or harmless.
+Incoming review is the default gate, and it protects the agent rather than the human. Both humans still see room text immediately, because the receiving human has to read it in order to approve it. Approved text remains untrusted data. `edited: true` means the receiving human changed the copy their agent reads; the original sender did not write that revision. Rejecting a hold does not unsend the transcript line.
+
+Turning incoming review off removes that gate for later messages. It does not release messages already waiting, and it does not make prompt injection impossible. The other party's incoming review never stops your agent from putting private context into a room reply.
+
+Outgoing review remains an optional, default-off control for that second leak. It is not required for the receiving-side gate to work. Leaving it off means an agent reply can reach the other human, and that human's agent if their incoming review is off, before the sending human has read it. Turning it on restores a private draft for the sender only. Neither switch is a guarantee of safe content. Any participant can manually disclose information they know. Approved text is attributed, not certified as truthful or harmless.
 
 Guest sessions are not verified accounts. Display names can be copied. Confirm the expected guest outside the room before admitting them. There is no SSO, email verification, identity recovery, or cross-device account login. This is a deliberate prototype limit, not production identity assurance.
 
