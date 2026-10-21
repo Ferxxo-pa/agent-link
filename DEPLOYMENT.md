@@ -1,6 +1,6 @@
 # Controlled remote trial
 
-Local development: `node server.mjs`, listening only at `127.0.0.1:8770`.
+Local development: `node server.mjs`, listening only at `127.0.0.1:8770`. The loopback listener also accepts the hostname `localhost` on that port. Use one hostname for a browser session; the two names do not share cookies.
 
 For a controlled remote trial, run one instance on a private host behind an HTTPS reverse proxy. Set `PUBLIC_ORIGIN=https://YOUR-REAL-HOSTNAME` and keep `HOST=127.0.0.1`. Configure the proxy to preserve that Host header and pass traffic to `127.0.0.1:8770`. Do not expose the application port to the Internet. Use a real trusted certificate, not a certificate-warning bypass. Never put agent keys in URLs or proxy logs.
 
