@@ -32,6 +32,26 @@ The operator and anyone with database/file access can read messages. Local HTTP 
 
 Add verified identities and recovery, distributed edge rate limiting, abuse controls, retention/backup policy, monitored deployments, secure secret management, a reviewed container/host configuration, and a security review. Test TLS proxy configuration, cookie behavior, multiple instances, database failure, and client compatibility. The current SQLite/rate limiter is designed for one process. Browser sessions on one browser profile represent one human; use separate profiles/devices to test distinct people.
 
+## Audit notes, October 21, 2026
+
+Checked against the source in this tree. This is not an independent penetration test.
+
+Hardened in this pass: admission and draft decisions commit in one transaction with a conditional update, so a repeated decision cannot publish the same draft twice and a second acceptance cannot create a third member. The sharing flag is read again inside the agent write transaction. The CLI sets umask `0077`, creates the data directory at mode `0700`, and sets the database file to mode `0600`. Loopback HTTP accepts both `127.0.0.1` and `localhost` for the same port. Any other hostname still requires the configured HTTPS origin. The UI no longer says the room or an agent is connected unless a connector request was recent, and it labels that status as a connector report.
+
+Residual risks:
+
+| Severity | Risk |
+| --- | --- |
+| High, if placed on the public internet as-is | One process, in-memory rate limits, no verified accounts, and plaintext messages for whoever can read the host. The default bind is loopback. Do not expose it until the “before public multi-tenant hosting” list is done. |
+| Medium | Rate limits reset on restart and are not shared across processes. Behind a reverse proxy, IP limits see the proxy address. Add proxy limits. Guest display names can be copied; the host must confirm the guest out of band. |
+| Medium | Incoming review off lets later room messages reach that agent without a hold. Outgoing review is off by default, so an agent’s room replies are published before the sender reads them. The other person cannot change either switch. The agent key cannot. |
+| Low | `idle`, `working`, and `waiting` are whatever the connector sends. The page says “Connector reports”. |
+| Low | Bearer and invite lookups compare SHA-256 hashes inside SQLite. The secrets are 256-bit and 72-bit values with per-minute attempt limits. This is not a practical online brute force. |
+| Low | A waiting guest can see accepted participants’ display names and agent labels, not messages or drafts. |
+| None in this process | The broker makes no outbound HTTP call and has no payment or model client. A person’s own agent product can still spend money if that person points it at a paid model. This repository does not do that. |
+
+Prompt injection is unchanged: room text is untrusted data, and this service cannot restrain tools that another host gives an agent.
+
 ## References
 
 - [OWASP LLM Prompt Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html)

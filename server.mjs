@@ -1,8 +1,9 @@
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { readFile, mkdir } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { readFile, mkdir, chmod } from 'node:fs/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const secret = () => randomBytes(32).toString('base64url');
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -16,11 +17,22 @@ function text(value, max = 4000) {
   return value.trim();
 }
 // Review flags stay on the caller's own member. Participants must not carry them.
-function publicMember(m) {
-  return { id: m.id, name: m.name, agentName: m.agent_name, status: m.status, agentStatus: m.agent_status, lastSeen: m.last_seen };
+function publicMember(m, clock) {
+  return { id: m.id, name: m.name, agentName: m.agent_name, status: m.status, agentStatus: m.agent_status, lastSeen: m.last_seen, connectorRecent: m.last_seen > 0 && clock - m.last_seen < 20000 };
 }
-function selfMember(m) {
-  return { ...publicMember(m), incomingReview: !!m.incoming_review, outgoingReview: !!m.outgoing_review };
+function selfMember(m, clock) {
+  return { ...publicMember(m, clock), incomingReview: !!m.incoming_review, outgoingReview: !!m.outgoing_review };
+}
+function loopbackOrigin(value, expected) {
+  if (expected.protocol !== 'http:' || (expected.hostname !== '127.0.0.1' && expected.hostname !== 'localhost')) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && url.port === expected.port && (url.hostname === '127.0.0.1' || url.hostname === 'localhost') && !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash;
+  } catch { return false; }
+}
+export async function prepareDataDir(directory) {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
 }
 
 export function createApp({ database = ':memory:', publicOrigin, now = Date.now, roomTtl = 3600000, rateLimit = 120 } = {}) {
@@ -76,7 +88,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
   function routeTo(r, recipient, e) {
     if (e.private_to && e.private_to !== recipient.id) return;
     if (queued(recipient.id, e.id)) return;
-    const inbound = !e.private_to && e.member !== recipient.id && (e.kind === 'message' || e.kind === 'approved-message');
+    const inbound = !e.private_to && e.member !== recipient.id && (e.kind === 'message' || e.kind === 'approved-message' || e.kind === 'approved-edited-message');
     if (inbound && recipient.incoming_review) holdTo(r, recipient, e);
     else releaseTo(recipient.id, e);
   }
@@ -123,8 +135,9 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
     try {
       const origin = publicOrigin || `http://127.0.0.1:${server.address()?.port}`;
       const expected = new URL(origin);
-      if (req.headers.host !== expected.host) throw error(403,'Host rejected');
-      if (req.headers.origin && req.headers.origin !== origin) throw error(403,'Origin rejected');
+      const originMatches = value => typeof value === 'string' && (value === expected.origin || loopbackOrigin(value, expected));
+      if (req.headers.host !== expected.host && !loopbackOrigin('http://'+req.headers.host, expected)) throw error(403,'Host rejected');
+      if (req.headers.origin && !originMatches(req.headers.origin)) throw error(403,'Origin rejected');
       const url = new URL(req.url, origin), path = url.pathname;
       if (expected.protocol === 'https:') res.setHeader('Strict-Transport-Security','max-age=31536000');
       const staticFiles = new Map([['/','index.html'],['/ui.js','ui.js'],['/style.css','style.css']]);
@@ -138,7 +151,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
       let body = {};
       if (req.method === 'POST') {
         if (!req.headers['content-type']?.startsWith('application/json')) throw error(415,'JSON required');
-        if (!isAgent && req.headers.origin !== origin) throw error(403,'Same-origin request required');
+        if (!isAgent && !originMatches(req.headers.origin)) throw error(403,'Same-origin request required');
         let size=0, chunks=[];for await(const chunk of req){size+=chunk.length;if(size>12000)throw error(413,'Request too large');chunks.push(chunk);}
         try { body=JSON.parse(Buffer.concat(chunks).toString()||'{}'); } catch { throw error(400,'Invalid JSON'); }
       }
@@ -169,7 +182,7 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
           syncMember(r,m.id);
           const events=all('SELECT id,event_id,member,actor,kind,text,private_to,at,edited FROM releases WHERE room=? AND recipient=? AND id>? ORDER BY id LIMIT 100',r.id,m.id,cursor);
           const last=events.at(-1);
-          return reply(200,{room:{id:r.id,title:r.title,expires:r.expires},self:selfMember(one('SELECT * FROM members WHERE id=?',m.id)),participants:all("SELECT * FROM members WHERE room=? AND status='accepted'",r.id).map(publicMember),events:events.map(agentEvent),cursor:last?Number(last.id):cursor,proposals:all('SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? ORDER BY rowid DESC LIMIT 50',r.id,m.id)});
+          return reply(200,{room:{id:r.id,title:r.title,expires:r.expires},serverNow:now(),self:selfMember(one('SELECT * FROM members WHERE id=?',m.id),now()),participants:all("SELECT * FROM members WHERE room=? AND status='accepted'",r.id).map(person=>publicMember(person,now())),events:events.map(agentEvent),cursor:last?Number(last.id):cursor,proposals:all('SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? ORDER BY rowid DESC LIMIT 50',r.id,m.id)});
         }
         if(path==='/api/agent/status'&&req.method==='POST'){fields(body,['status']);if(!['idle','working','waiting'].includes(body.status))throw error(400,'Invalid status');run('UPDATE members SET agent_status=? WHERE id=?',body.status,m.id);return reply(200,{status:body.status});}
         if(path==='/api/agent/message'&&req.method==='POST'){
@@ -217,18 +230,18 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
       const r=room(match[1]),m=member(r,session.id),operation=match[2];
       if(!operation&&req.method==='GET'){
         const isHost=r.host===session.id;
-        const participants=all('SELECT * FROM members WHERE room=?',r.id).filter(x=>isHost||x.status==='accepted'||x.id===m.id).map(publicMember);
-        if(m.status!=='accepted')return reply(200,{id:r.id,title:r.title,expires:r.expires,self:selfMember(m),host:false,participants,events:[],proposals:[],holds:[]});
+        const participants=all('SELECT * FROM members WHERE room=?',r.id).filter(x=>isHost||x.status==='accepted'||x.id===m.id).map(person=>publicMember(person,now()));
+        if(m.status!=='accepted')return reply(200,{id:r.id,title:r.title,expires:r.expires,serverNow:now(),self:selfMember(m,now()),host:false,participants,events:[],proposals:[],holds:[]});
         syncMember(r,m.id);
-        return reply(200,{id:r.id,title:r.title,expires:r.expires,self:selfMember(one('SELECT * FROM members WHERE id=?',m.id)),host:isHost,participants,events:all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND (private_to IS NULL OR private_to=?) ORDER BY id',r.id,m.id),proposals:all("SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? AND status='pending' AND expires>?",r.id,m.id,now()),holds:pendingHolds(r,m.id)});
+        return reply(200,{id:r.id,title:r.title,expires:r.expires,serverNow:now(),self:selfMember(one('SELECT * FROM members WHERE id=?',m.id),now()),host:isHost,participants,events:all('SELECT id,member,actor,kind,text,private_to,at FROM events WHERE room=? AND (private_to IS NULL OR private_to=?) ORDER BY id',r.id,m.id),proposals:all("SELECT id,text,digest,status,expires FROM proposals WHERE room=? AND member=? AND status='pending' AND expires>?",r.id,m.id,now()),holds:pendingHolds(r,m.id)});
       }
       admitted(m);if(req.method!=='POST')throw error(405,'Method not allowed');
       if(operation==='admit'){
         fields(body,['memberId','accept']);if(r.host!==session.id)throw error(403,'Only host can admit');if(typeof body.accept!=='boolean'||typeof body.memberId!=='string')throw error(400,'Choose a request and accept or decline');
-        const target=one("SELECT * FROM members WHERE id=? AND room=? AND status='waiting'",body.memberId,r.id);if(!target)throw error(409,'Request already resolved');
-        if(body.accept&&one("SELECT count(*) n FROM members WHERE room=? AND status='accepted'",r.id).n>=2)throw error(409,'This version supports two human-agent pairs');
         transact(()=>{
-          run('UPDATE members SET status=? WHERE id=?',body.accept?'accepted':'declined',target.id);
+          const target=one("SELECT * FROM members WHERE id=? AND room=? AND status='waiting'",body.memberId,r.id);if(!target)throw error(409,'Request already resolved');
+          if(body.accept&&one("SELECT count(*) n FROM members WHERE room=? AND status='accepted'",r.id).n>=2)throw error(409,'This version supports two human-agent pairs');
+          if(Number(run("UPDATE members SET status=? WHERE id=? AND status='waiting'",body.accept?'accepted':'declined',target.id).changes)!==1)throw error(409,'Request already resolved');
           if(body.accept)syncMember(r,target.id);
           event(r,m,'system','membership',`${target.name} ${body.accept?'joined':'was declined'}`);
         });
@@ -274,8 +287,9 @@ export function createApp({ database = ':memory:', publicOrigin, now = Date.now,
           transact(()=>{
             const changed=run("UPDATE proposals SET status=? WHERE id=? AND status='pending'",approved?'approved':'rejected',proposal.id);
             if(!Number(changed.changes))throw error(409,'Proposal changed, expired, or already decided');
-            event(r,m,approved?'agent':'human',approved?'approved-message':'feedback',value,approved?null:m.id);
-            event(r,m,'human','decision',approved?'Approved agent message':'Requested changes',m.id);
+            const kind=approved?(value===proposal.text?'approved-message':'approved-edited-message'):'feedback';
+            event(r,m,approved?'agent':'human',kind,value,approved?null:m.id);
+            event(r,m,'human','decision',approved?(kind==='approved-edited-message'?'Approved an edited agent message':'Approved agent message'):'Requested changes',m.id);
           });
           return reply(200,{status:approved?'approved':'rejected'});
         }
@@ -304,7 +318,12 @@ if(process.argv[1]===fileURLToPath(import.meta.url)){
   const publicOrigin=process.env.PUBLIC_ORIGIN||`http://127.0.0.1:${port}`;
   const origin=new URL(publicOrigin);
   if(origin.origin!==publicOrigin||origin.username||origin.password)throw new Error('PUBLIC_ORIGIN must be an exact origin');
-  if(origin.protocol!=='https:'&&!(host==='127.0.0.1'&&origin.hostname==='127.0.0.1'))throw new Error('Remote use requires HTTPS via a trusted reverse proxy');
-  const dir=new URL('./.local/',import.meta.url);await mkdir(dir,{recursive:true});
-  createApp({database:fileURLToPath(new URL('rooms.sqlite',dir)),publicOrigin}).listen(port,host,()=>console.log(`Agent Link: ${publicOrigin} (guest sessions; room access requires host approval)`));
+  if(origin.protocol!=='https:'&&!(host==='127.0.0.1'&&(origin.hostname==='127.0.0.1'||origin.hostname==='localhost')))throw new Error('Remote use requires HTTPS via a trusted reverse proxy');
+  process.umask(0o077);
+  const dir=process.env.AGENT_LINK_DATA?pathToFileURL(path.resolve(process.env.AGENT_LINK_DATA)+path.sep):new URL('./.local/',import.meta.url);
+  await prepareDataDir(dir);
+  const database=fileURLToPath(new URL('rooms.sqlite',dir));
+  const server=createApp({database,publicOrigin});
+  await chmod(database,0o600);
+  server.listen(port,host,()=>console.log(`Agent Link: ${publicOrigin} (guest sessions; room access requires host approval)`));
 }

@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import http from 'node:http';
-import { createApp } from '../server.mjs';
+import { createApp, prepareDataDir } from '../server.mjs';
 import { AgentLink } from '../client.mjs';
 
 export async function fixture(t,options={}){
@@ -71,7 +72,7 @@ test('outgoing review binds the exact draft, only its human decides, and edited 
  assert.equal((await f.a.request(f.path+'/decision',{...data,digest:'0'.repeat(64)})).status,409);
  assert.equal((await f.a.request(f.path+'/decision',data)).status,200);
  assert.equal((await f.a.request(f.path+'/decision',data)).status,409);
- const published=(await f.b.request(f.path)).data;assert.equal(published.events.filter(e=>e.text==='Human edited message').length,1);assert.ok(!published.events.some(e=>e.text==='Original'));
+ const published=(await f.b.request(f.path)).data;assert.equal(published.events.filter(e=>e.text==='Human edited message').length,1);assert.equal(published.events.find(e=>e.text==='Human edited message').kind,'approved-edited-message');assert.ok(!published.events.some(e=>e.text==='Original'));
  assert.equal(published.holds[0].text,'Human edited message');
  assert.ok((await aa.inbox()).events.some(e=>e.text==='Human edited message'));
  assert.ok(!(await bb.inbox()).events.some(e=>e.text==='Human edited message'));
@@ -230,4 +231,49 @@ test('client rejects insecure remote URLs and forbids redirect-based credential 
  assert.throws(()=>new AgentLink({url:'http://example.com',token:'a'.repeat(43)}));
  let options;const c=new AgentLink({url:'https://rooms.example.com',token:'a'.repeat(43),fetcher:async(_,o)=>{options=o;return {ok:true,json:async()=>({events:[],cursor:0})};}});await c.inbox();assert.equal(options.redirect,'error');
  let count=0;const watch=new AgentLink({url:'http://127.0.0.1:1234',token:'a'.repeat(43),fetcher:async()=>{count++;return {ok:true,json:async()=>({events:[{id:1}],cursor:1})};}});const batches=[];for await(const b of watch.watch({maxPolls:1}))batches.push(b);assert.equal(count,1);assert.equal(batches.length,1);
+});
+test('one approval or admission cannot be applied twice',async t=>{
+ const f=await fixture(t);const cara=await f.human('Cara');assert.equal((await cara.request('/api/join',{code:f.code,agentName:'Extra'})).status,201);
+ const waiting=(await f.a.request(f.path)).data.participants.filter(p=>p.status==='waiting');assert.equal(waiting.length,2);
+ const admitted=await Promise.all(waiting.map(p=>f.a.request(f.path+'/admit',{memberId:p.id,accept:true})));
+ assert.deepEqual(admitted.map(r=>r.status).sort(),[200,409]);
+ const room=(await f.a.request(f.path)).data;
+ assert.equal(room.participants.filter(p=>p.status==='accepted').length,2);
+ const guest=room.participants.find(p=>p.status==='accepted'&&p.id!==room.self.id);
+ const owner=guest.name==='Bob'?f.b:cara;
+ await f.a.request(f.path+'/policy',{outgoingReview:true});
+ const aa=await f.agent(f.a);const proposal=await aa.message('Once');assert.equal(proposal.status,'awaiting_approval');
+ const decision={id:proposal.proposalId,digest:proposal.digest,decision:'approve'};
+ const decided=await Promise.all([f.a.request(f.path+'/decision',decision),f.a.request(f.path+'/decision',decision)]);
+ assert.deepEqual(decided.map(r=>r.status).sort(),[200,409]);
+ const shared=(await aa.inbox()).events.filter(e=>e.kind==='approved-message'&&e.text==='Once');assert.equal(shared.length,1);
+ const held=(await owner.request(f.path)).data.holds.find(h=>h.text==='Once');
+ assert.ok(held);
+ const release={id:held.id,digest:held.digest,decision:'approve'};
+ const released=await Promise.all([owner.request(f.path+'/decision',release),owner.request(f.path+'/decision',release)]);
+ assert.deepEqual(released.map(r=>r.status).sort(),[200,409]);
+ const link=await f.agent(owner);
+ assert.equal((await link.inbox()).events.filter(e=>e.text==='Once').length,1);
+});
+test('loopback accepts localhost and 127.0.0.1, and a public origin does not',async t=>{
+ const app=createApp();app.listen(0,'127.0.0.1');await once(app,'listening');const port=app.address().port;
+ t.after(()=>new Promise(resolve=>{app.close(resolve);app.closeAllConnections();}));
+ const get=host=>new Promise((resolve,reject)=>{const req=http.get({hostname:'127.0.0.1',port,path:'/health',headers:{Host:host}},res=>{res.resume();resolve(res.statusCode);});req.on('error',reject);});
+ assert.equal(await get('127.0.0.1:'+port),200);assert.equal(await get('localhost:'+port),200);assert.equal(await get('evil.example'),403);
+ const posted=await fetch('http://127.0.0.1:'+port+'/api/session',{method:'POST',headers:{Host:'localhost:'+port,Origin:'http://localhost:'+port,'Content-Type':'application/json'},body:JSON.stringify({name:'Local'})});
+ assert.equal(posted.status,200);
+ const remote=createApp({publicOrigin:'https://rooms.example.com'});remote.listen(0,'127.0.0.1');await once(remote,'listening');
+ t.after(()=>new Promise(resolve=>{remote.close(resolve);remote.closeAllConnections();}));
+ const remotePort=remote.address().port;
+ const remoteGet=host=>new Promise((resolve,reject)=>{const req=http.get({hostname:'127.0.0.1',port:remotePort,path:'/health',headers:{Host:host}},res=>{res.resume();resolve(res.statusCode);});req.on('error',reject);});
+ assert.equal(await remoteGet('rooms.example.com'),200);assert.equal(await remoteGet('localhost:'+remotePort),403);
+});
+test('the data directory is not left world-readable',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'agent-link-dir-'));try{await prepareDataDir(pathToFileURL(dir+'/'));assert.equal((await stat(dir)).mode&0o777,0o700);}finally{await rm(dir,{recursive:true,force:true});}
+});
+test('the room page does not claim a live connection or a provider integration',async()=>{
+ const ui=await readFile(new URL('../public/ui.js',import.meta.url),'utf8');const html=await readFile(new URL('../public/index.html',import.meta.url),'utf8');const css=await readFile(new URL('../public/style.css',import.meta.url),'utf8');
+ assert.equal(ui.includes('Room connected'),false);assert.equal(ui.includes('Live room'),false);assert.equal(ui.includes('Agent not connected'),false);
+ assert.match(ui,/No recent connector/);assert.match(ui,/Connector reports /);assert.match(ui,/Two people in the room/);
+ assert.equal(/Grok|Muse|\bDot\b/.test(html+ui),false);assert.equal(css.includes('animation:idle'),false);
 });

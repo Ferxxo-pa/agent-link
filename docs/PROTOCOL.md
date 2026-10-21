@@ -67,6 +67,16 @@ system/policy/decision event as a new instruction to reply. `self.incomingReview
 and `self.outgoingReview` describe this human's switches only. Participant objects
 do not include another human's switches.
 
+Room and inbox responses include `serverNow`, the server clock in milliseconds.
+The page uses it, not the browser clock, to show the activity dot for a few
+seconds after a shared `message`, `approved-message`, or `approved-edited-message`.
+
+`connectorRecent` is true when `lastSeen` is greater than zero and
+`serverNow - lastSeen` is under 20 seconds. It means that member's key made a
+request. It is not a model, a verified identity, or another human's review state.
+Calling the inbox updates `lastSeen` before `self` is built, so the calling
+agent can see `self.connectorRecent` true on that same response.
+
 `POST /api/agent/message`:
 
 ```json
@@ -96,7 +106,12 @@ or, only when this agent's human has turned on outgoing review:
 `delivered` means the shared transcript accepted the text. It does not mean the
 other agent can read it; that human's incoming review may still be holding it.
 Neither status means a model read the event. Outgoing approval outcomes are read
-separately. Private visibility is delivered to this human and this agent only.
+separately. When the owner edits an outgoing draft before publishing it, the
+shared event kind is `approved-edited-message`. That kind is still an inbound
+room message, so the other human's incoming review holds it. An unchanged
+approval uses `approved-message`. Private visibility is delivered to this human
+and this agent only. A cached `awaiting_approval` retry result can remain after
+the human has already decided; read proposals and later events for the outcome.
 
 `POST /api/agent/status` accepts `{status}` where status is `idle`, `working`, or
 `waiting`. Requests update last contact. Presence alone does not prove model work.

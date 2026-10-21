@@ -14,10 +14,15 @@ simple as sharing a code and accepting the expected participant. The product is
 MIT-licensed and intended to be self-hostable.
 Provider compatibility depends on the interfaces the actual agent host supports.
 
-Keep the UI direct: two agent characters with owner labels, a dot moving on real
-shared events, a transcript, a private/everyone composer, and one notification bell
-near the composer. The bell contains admission, incoming-message review, and optional outgoing-draft actions.
-Do not substitute animation for transport evidence or fabricate agent replies.
+Keep the UI direct: two agent characters with owner labels, a transcript, a
+private/everyone composer, and one notification bell near the composer. The bell
+contains admission, incoming-message review, and optional outgoing-draft actions.
+The characters stay still. A dot appears only for a few seconds after a real
+shared message (`message`, `approved-message`, or `approved-edited-message`),
+timed from the server clock. Connector text says “No recent connector” until
+that member’s key makes a request, then “Connector reports” plus the status the
+connector sent. That status is self-reported. Do not substitute animation for
+transport evidence or fabricate agent replies.
 
 The user previously explored a call metaphor and a scripted demo, then chose a
 collaborative room. Real avatars and subscriptions were deferred. Preserve the
@@ -62,9 +67,9 @@ Not implemented or not verified:
 - End-to-end encryption, payments, attachments, code execution, or billing.
 - Independent security review or proof of prompt-injection immunity.
 
-The first implementation commit was `91baebd` on `feat/secure-rooms`. At that
-point the repository was local only. Consult Git remotes and hosting state for
-publication status rather than treating this historical note as current status.
+Publication history is the commits on `main`. This repository has no
+`feat/secure-rooms` branch. An earlier note that named commit `91baebd` does
+not match any commit in this tree. Consult Git remotes for publication status.
 
 ## Components and trust boundaries
 
@@ -93,7 +98,7 @@ that another application exposes to an agent.
 | `client.mjs` | HTTP SDK, redirect refusal, timeouts, bounded polling |
 | `mcp.mjs` | JSON-RPC stdio lifecycle and four room tools |
 | `public/ui.js` | Human interaction, polling, admission, review, connection setup |
-| `public/style.css` | Minimal room UI and character/activity animation |
+| `public/style.css` | Minimal room UI. Characters are static. The packet stays hidden until a real shared message |
 | `test/rooms.test.mjs` | HTTP boundary, persistence, and SDK tests |
 | `test/mcp.test.mjs` | MCP subprocess integration |
 
@@ -186,13 +191,20 @@ See SECURITY.md for the full boundary and DEPLOYMENT.md for hosting requirements
 
 ## Testing evidence
 
-The initial full run passed 14 automated tests. The current suite is 16 tests and
-covers incoming review, edited agent-only copies, rejection, the two per-human
-switches, legacy outgoing-review migration, and the MCP connector. A later local
-browser pass edited and approved an incoming room message, confirmed the transcript
-kept the original wording, turned incoming review off, and saw the next room
-message arrive with no hold. Those checks used a test connector with no model
-attached. They verify transport and the review gate, not a real two-model conversation.
+The automated suite covers incoming review, edited agent-only copies, rejection,
+the two per-human switches, legacy outgoing-review migration, concurrent admit
+and draft decisions, loopback host checks, data-directory permissions, the MCP
+connector, and a spawned two-person exchange. On October 21, 2026 that suite
+was 22 tests. Rerun it and use the count it prints. The author of the incoming-review commit reported a local browser pass
+that edited and approved an incoming room message, confirmed the transcript kept
+the original wording, turned incoming review off, and saw the next room message
+arrive with no hold. That report used a test connector with no model attached.
+A separate October 21 two-profile browser check covered the earlier
+outgoing-approval page and did not exercise incoming holds. A later headless
+two-profile pass on this checkout confirmed the server-status header, the
+two-person label, a static character, a hidden packet until a real shared
+message, the connector placeholder, and one edited incoming release that left
+the transcript unchanged. Neither check is a real two-model conversation.
 
 Rerun the suite for the current checkout:
 

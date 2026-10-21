@@ -1,6 +1,8 @@
 # Agent Link
 
-**New contributors and agents:** start with [the engineering handoff](docs/HANDOFF.md), then [the protocol reference](docs/PROTOCOL.md). Read [SECURITY.md](SECURITY.md) before connecting an agent or exposing the service remotely.
+**Start here:** [WALKTHROUGH.md](WALKTHROUGH.md) — what this is, how to run a room, how to invite someone, and copy-paste instructions for each agent.
+
+**New contributors:** then read [the engineering handoff](docs/HANDOFF.md), [the protocol reference](docs/PROTOCOL.md), and [SECURITY.md](SECURITY.md) before connecting an agent or exposing the service remotely.
 
 An independent, MIT-licensed service for temporary rooms shared by two humans and their agents. No Neurofolio, Supabase, provider API key, or paid subscription is required. Messages are real HTTP exchanges, not scripted responses. The service does not generate model replies itself.
 
@@ -21,7 +23,7 @@ node --test test/*.test.mjs
 5. Humans can send private instructions or explicitly select **Everyone in the room**. Private notes go straight to your own agent. Room messages from the other person and their agent wait in the bell until you let your agent read them.
 6. Review, edit, or reject those incoming messages using the bell. Either human can end the room, revoking both agents' access.
 
-The browser refreshes from the backend every two seconds and automatically retries transient failures. The dot moves after actual shared events. Agent presence is based on recent connector requests, not on a fabricated “connected” animation. The room lasts one hour; guest sessions last four hours; pending message approvals expire after five minutes.
+The browser refreshes from the backend every two seconds and automatically retries transient failures. A dot on the line appears only for a few seconds after a real shared message. The character drawings do not animate. Connector text says “No recent connector” until that member’s key makes a request, and then “Connector reports” followed by the status that connector sent (`idle`, `working`, or `waiting`). That status is self-reported. It does not prove a model is running. The room lasts one hour; guest sessions last four hours; pending message approvals expire after five minutes. Open the app at `http://127.0.0.1:8770`. `localhost` is accepted as the same loopback server, but it is a different cookie jar, so do not mix the two hostnames in one session.
 
 ## Plug in an agent
 
@@ -34,7 +36,7 @@ Use this with an agent host supporting local stdio MCP servers. The UI provides 
   "mcpServers": {
     "agent-link": {
       "command": "node",
-      "args": ["/absolute/path/agent-link-core/mcp.mjs"],
+      "args": ["/ABSOLUTE/PATH/TO/agent-link/mcp.mjs"],
       "env": {
         "AGENT_LINK_URL": "http://127.0.0.1:8770",
         "AGENT_LINK_TOKEN": "YOUR_ROOM_SCOPED_KEY"
@@ -73,7 +75,7 @@ Remote clients use HTTPS. The connector refuses redirects so it cannot forward i
 
 For a running custom agent host, `for await (const batch of room.watch({maxPolls: 300, signal}))` provides bounded polling (two seconds by default). Process only relevant events and ignore your own messages to avoid echo loops. Your host remains responsible for model invocation, cost/turn budgets, cancellation, tool restrictions, and preventing private context from leaking. The SDK never launches a model itself. Read the inbox periodically to inspect approval outcomes as well as message events.
 
-Grok Bots, Muse, Dot, or other platforms can integrate **only if their host supports one of these interfaces**. No proprietary provider integration has been verified in this build. Use an isolated room worker rather than an agent with unrestricted access to private files or powerful tools.
+There is no Grok Bots, Muse, Dot, or other provider adapter in this repository. Nothing here signs you into those products, and none of them has been verified against this connector. An agent can join only when the program that already runs it can use this local MCP stdio connector or the HTTP API. Use an isolated room worker rather than an agent with unrestricted access to private files or powerful tools.
 
 ## Human control
 
@@ -93,9 +95,9 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for HTTPS reverse-proxy setup. The default li
 
 ## Repository and costs
 
-The standalone source is a new local Git repository, not a fork of Neurofolio's proprietary backend. No remote GitHub publication or package publication is performed by the source itself. The Neurofolio viewer is a separate backup app.
+This process does not publish packages, deploy a host, or call a model API. Running it does not upload rooms or keys. The Neurofolio viewer is a separate backup app and is not in this repository.
 
-Self-hosting is free software; hosting and any model usage are paid by whoever runs them. No billing or subscriptions are implemented. A future hosted subscription could pay for managed hosting and verified accounts without closing the core protocol.
+The server has no billing and no subscription. Local use does not require an API key. Hosting a copy, registering a domain, and any model calls made by the participants’ own agent products are paid by whoever chooses those services. See [WALKTHROUGH.md](WALKTHROUGH.md) for current options. No hosted subscription is implemented.
 
 ## Tests
 
